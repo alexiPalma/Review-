@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Telegram Text for FunPay Cardinal.
 
-Поток: покупка -> username -> подтверждение -> текст -> отправка.
-Использует общую Telethon session Telegram Gifts.
+Поток: покупка -> username -> подтверждение -> текст -> проверка paid messages -> отправка.
+Один файл: хранит заказы/привязки, авторизацию и Telegram worker.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from pathlib import Path
 from FunPayAPI.types import MessageTypes
 
 NAME = "Telegram Text"
-VERSION = "3.0.1"
+VERSION = "3.1.0"
 DESCRIPTION = "Автоматическая отправка текста после покупки привязанного лота."
 CREDITS = "@podarckov"
 UUID = "2b5d7f4a-8c31-4e96-a172-53f9d0b64c28"
@@ -45,11 +45,12 @@ LOT_BINDINGS_FILE = PLUGIN_DIR / "lot_bindings.json"
 STATUS_USERNAME = "await_username"
 STATUS_CONFIRM = "await_confirm"
 STATUS_TEXT = "await_text"
+STATUS_PAID_GUARD = "await_paid_guard"
 STATUS_SENDING = "sending"
 STATUS_COMPLETED = "completed"
 STATUS_REFUNDED = "refunded"
 STATUS_ERROR = "error"
-ACTIVE_STATUSES = (STATUS_USERNAME, STATUS_CONFIRM, STATUS_TEXT, STATUS_SENDING, STATUS_ERROR)
+ACTIVE_STATUSES = (STATUS_USERNAME, STATUS_CONFIRM, STATUS_TEXT, STATUS_PAID_GUARD, STATUS_SENDING, STATUS_ERROR)
 USERNAME_RE = re.compile(r"^@?[A-Za-z0-9_]{5,32}$")
 ID_RE = re.compile(r"(?i)(?:^|[^A-Za-z0-9_])ID\s*:\s*(\d{10,25})(?:[^0-9]|$)")
 MAX_TEXT = 4096
@@ -126,7 +127,6 @@ def load_state():
                 order["status"] = STATUS_ERROR
                 order["error"] = "Cardinal был перезапущен во время отправки."
         persist_state()
-    logger.info("Telegram Text: заказов=%s, привязок=%s", len(_orders), len(_lot_bindings))
 
 
 def get_order(oid):
@@ -208,9 +208,7 @@ def get_full_order(c, event):
 
 
 def find_order_lot(c, event, order):
-    for obj in (order, getattr(event, "order", None), getattr(order, "offer", None),
-                getattr(order, "lot", None), getattr(order, "shortcut", None),
-                getattr(order, "order_shortcut", None)):
+    for obj in (order, getattr(event, "order", None), getattr(order, "offer", None), getattr(order, "lot", None), getattr(order, "shortcut", None), getattr(order, "order_shortcut", None)):
         value = lot_id_from_object(obj)
         if value is not None:
             return value
@@ -246,16 +244,7 @@ def resolve_text_lot(c, event, order):
             binding = _lot_bindings.get(str(lot_id))
         if isinstance(binding, dict) and binding.get("enabled", True):
             return str(lot_id), "binding"
-
-    # ID из полного описания лота — fallback, как в Gifts.
-    for value in (
-        fetch_lot_description(c, lot_id),
-        getattr(order, "full_description", None),
-        getattr(order, "description", None),
-        getattr(order, "short_description", None),
-        getattr(getattr(event, "order", None), "full_description", None),
-        getattr(getattr(event, "order", None), "description", None),
-    ):
+    for value in (fetch_lot_description(c, lot_id), getattr(order, "full_description", None), getattr(order, "description", None), getattr(order, "short_description", None), getattr(getattr(event, "order", None), "full_description", None), getattr(getattr(event, "order", None), "description", None)):
         if extract_id(value) is not None:
             return str(lot_id) if lot_id else str(extract_id(value)), "description_id"
     return None
@@ -266,23 +255,18 @@ def find_order_by_message(msg):
     author_id = getattr(msg, "author_id", None)
     author = clean_text(getattr(msg, "author", None)).lstrip("@").casefold()
     with _state_lock:
-        candidates = []
-        for oid, order in _orders.items():
-            if order.get("status") not in ACTIVE_STATUSES:
-                continue
-            if chat_id is not None and str(order.get("chat_id")) == str(chat_id):
-                candidates.append((oid, order))
+        candidates = [(oid, o) for oid, o in _orders.items() if o.get("status") in ACTIVE_STATUSES and chat_id is not None and str(o.get("chat_id")) == str(chat_id)]
         if candidates:
             candidates.sort(key=lambda x: float(x[1].get("created_at", 0)), reverse=True)
             return candidates[0]
         if author_id is not None:
-            for oid, order in sorted(_orders.items(), key=lambda x: float(x[1].get("created_at", 0)), reverse=True):
-                if order.get("status") in ACTIVE_STATUSES and order.get("buyer_id") is not None and str(order.get("buyer_id")) == str(author_id):
-                    return oid, order
+            for oid, o in sorted(_orders.items(), key=lambda x: float(x[1].get("created_at", 0)), reverse=True):
+                if o.get("status") in ACTIVE_STATUSES and o.get("buyer_id") is not None and str(o.get("buyer_id")) == str(author_id):
+                    return oid, o
         if author:
-            for oid, order in sorted(_orders.items(), key=lambda x: float(x[1].get("created_at", 0)), reverse=True):
-                if order.get("status") in ACTIVE_STATUSES and clean_text(order.get("buyer", "")).lstrip("@").casefold() == author:
-                    return oid, order
+            for oid, o in sorted(_orders.items(), key=lambda x: float(x[1].get("created_at", 0)), reverse=True):
+                if o.get("status") in ACTIVE_STATUSES and clean_text(o.get("buyer", "")).lstrip("@").casefold() == author:
+                    return oid, o
     return None, None
 
 
@@ -336,7 +320,6 @@ class TelegramWorker:
         self.session_path = None
 
     def choose_session(self):
-        # Всегда предпочитаем общую session Gifts.
         for path in (SHARED_SESSION_FILE, Path(str(SHARED_SESSION_FILE) + ".session")):
             if path.exists():
                 return SHARED_SESSION_FILE
@@ -401,11 +384,7 @@ class TelegramWorker:
         if self.client is None:
             telethon = importlib.import_module("telethon")
             self.session_path = self.choose_session()
-            self.client = telethon.TelegramClient(
-                str(self.session_path), API_ID, API_HASH,
-                device_model="FunPay Cardinal Telegram Text",
-                system_version="Linux", app_version=VERSION,
-                lang_code="en", system_lang_code="en-US")
+            self.client = telethon.TelegramClient(str(self.session_path), API_ID, API_HASH, device_model="FunPay Cardinal Telegram Text", system_version="Linux", app_version=VERSION, lang_code="en", system_lang_code="en-US")
         if not self.client.is_connected():
             await self.client.connect()
         return self.client
@@ -415,15 +394,12 @@ class TelegramWorker:
         if not await client.is_user_authorized():
             return None
         me = await client.get_me()
-        return {"id": me.id, "username": me.username, "phone": me.phone,
-                "name": " ".join(x for x in (me.first_name, me.last_name) if x) or "—"}
+        return {"id": me.id, "username": me.username, "phone": me.phone, "name": " ".join(x for x in (me.first_name, me.last_name) if x) or "—"}
 
     async def send_code(self, phone):
         client = await self._get_client()
         if await client.is_user_authorized():
             return "authorized"
-        # send_code_request является штатным Telethon API и не требует ручного
-        # создания SendCodeRequest, что исключает несовместимость сигнатур.
         result = await client.send_code_request(phone)
         return result.phone_code_hash
 
@@ -442,23 +418,64 @@ class TelegramWorker:
         await client.sign_in(password=password)
         return "authorized"
 
+    async def paid_message_required(self, username):
+        """True only when Telegram says this exact recipient currently requires Stars.
+
+        user.send_paid_messages_stars > 0 only tells us that paid messages are enabled.
+        userFull.send_paid_messages_stars is the authoritative check for whether our
+        current account actually has to pay. A value of 0 means exempt; absent means
+        no paid-message requirement.
+        """
+        client = await self._get_client()
+        entity = await client.get_entity(username)
+        user_flag = getattr(entity, "send_paid_messages_stars", None)
+        if not user_flag:
+            return False, 0
+        try:
+            from telethon import functions
+            full = await client(functions.users.GetFullUserRequest(id=entity))
+            required = getattr(getattr(full, "full_user", None), "send_paid_messages_stars", None)
+            if required is None:
+                required = getattr(full, "send_paid_messages_stars", None)
+            if required is None:
+                return False, 0
+            required = int(required)
+            return required > 0, required
+        except Exception:
+            logger.exception("Telegram Text: не удалось проверить paid messages для %s", username)
+            # Без достоверной проверки не отправляем, чтобы не рисковать Stars.
+            raise RuntimeError("Не удалось безопасно проверить платные сообщения Telegram")
+
     async def send_text(self, username, text):
         client = await self._get_client()
         if not await client.is_user_authorized():
             raise RuntimeError("Telegram-аккаунт не авторизован")
+        required, stars = await self.paid_message_required(username)
+        if required:
+            raise PaidMessagesRequired(stars)
         await client.send_message(username, text)
 
     async def _process(self, oid):
         order = get_order(oid)
-        if not order or order.get("status") != STATUS_SENDING:
+        if not order or order.get("status") not in (STATUS_SENDING,):
             return
         try:
             await self.send_text(order["username"], order["text"])
+        except PaidMessagesRequired as exc:
+            update_order(oid, status=STATUS_PAID_GUARD, error=f"paid_messages:{exc.stars}", paid_stars=exc.stars)
+            amount = f" ({exc.stars} ⭐️)" if exc.stars else ""
+            send_funpay(order["chat_id"], "⚠️ У этого пользователя включена плата за входящие сообщения" + amount + ".\n\nПожалуйста, отключите плату за сообщения в Telegram, после отключения отправьте «+».\n\nПодарок/сообщение не отправлено.")
+            return
         except Exception as exc:
             name = type(exc).__name__
+            upper = str(exc).upper()
             if name in {"UsernameInvalidError", "UsernameNotOccupiedError", "PeerIdInvalidError", "UserIdInvalidError"}:
                 update_order(oid, status=STATUS_USERNAME, error=name)
-                send_funpay(order["chat_id"], "❌ Telegram не нашёл этот юз. Отправьте другой @username.")
+                send_funpay(order["chat_id"], "❌ Telegram не нашёл этот username. Отправьте другой @username.")
+                return
+            if "ALLOW_PAYMENT_REQUIRED" in upper or "PAID_MESSAGES" in upper and "REQUIRED" in upper:
+                update_order(oid, status=STATUS_PAID_GUARD, error=name)
+                send_funpay(order["chat_id"], "⚠️ Telegram всё ещё требует оплату за сообщение.\n\nПожалуйста, отключите плату за сообщения и отправьте «+». Сообщение не отправлено.")
                 return
             if name == "FloodWaitError":
                 seconds = int(getattr(exc, "seconds", 0))
@@ -467,11 +484,7 @@ class TelegramWorker:
                     await asyncio.sleep(seconds)
                     current = get_order(oid)
                     if current and current.get("status") == STATUS_SENDING:
-                        try:
-                            await self.send_text(current["username"], current["text"])
-                        except Exception as retry:
-                            update_order(oid, status=STATUS_ERROR, error=type(retry).__name__)
-                            send_funpay(order["chat_id"], "❌ Не удалось отправить сообщение. Напишите + для повторной попытки или !возврат.")
+                        await self._process(oid)
                     return
                 update_order(oid, status=STATUS_ERROR, error=f"FloodWait:{seconds}")
                 send_funpay(order["chat_id"], "❌ Telegram временно ограничил отправку. Напишите + позже или !возврат.")
@@ -517,6 +530,12 @@ class TelegramWorker:
         self.thread = None
 
 
+class PaidMessagesRequired(Exception):
+    def __init__(self, stars=0):
+        self.stars = int(stars or 0)
+        super().__init__(f"paid_messages:{self.stars}")
+
+
 def ensure_worker():
     global _worker
     if _worker is None:
@@ -532,8 +551,7 @@ def start_auth(message):
 
 
 def command_account(message):
-    if not authorized(message):
-        return
+    if not authorized(message): return
     if not ensure_worker():
         panel_send(message, "❌ Telegram worker не удалось запустить.")
         return
@@ -541,7 +559,6 @@ def command_account(message):
         info = _worker.call(lambda: _worker.account_info(), 30)
     except Exception as exc:
         logger.exception("Telegram Text: account info")
-        info = None
         panel_send(message, f"⚠️ Не удалось проверить текущую session: {type(exc).__name__}.\n\nПопробуйте /text_account_reset.")
         return
     if info:
@@ -552,8 +569,7 @@ def command_account(message):
 
 
 def command_account_reset(message):
-    if not authorized(message):
-        return
+    if not authorized(message): return
     if not ensure_worker():
         panel_send(message, "❌ Telegram worker не удалось запустить.")
         return
@@ -565,16 +581,13 @@ def command_account_reset(message):
 
 
 def auth_message(message):
-    if not authorized(message):
-        return False
+    if not authorized(message): return False
     uid = int(message.from_user.id)
     with _auth_lock:
         data = dict(_auth_states.get(uid) or {})
-    if not data:
-        return False
+    if not data: return False
     text = msg_text(message)
-    if not text or text.startswith("/"):
-        return False
+    if not text or text.startswith("/"): return False
     if not ensure_worker():
         panel_send(message, "❌ Telegram worker не запущен.")
         return True
@@ -587,13 +600,11 @@ def auth_message(message):
                 return True
             result = _worker.call(lambda: _worker.send_code(phone), 90)
             if result == "authorized":
-                with _auth_lock:
-                    _auth_states.pop(uid, None)
+                with _auth_lock: _auth_states.pop(uid, None)
                 panel_send(message, "✅ Telegram-аккаунт уже авторизован.")
                 return True
             data.update(phone=phone, phone_code_hash=result, state="code")
-            with _auth_lock:
-                _auth_states[uid] = data
+            with _auth_lock: _auth_states[uid] = data
             panel_send(message, "📨 Код отправлен Telegram. Введите код одним сообщением.")
             return True
         if state == "code":
@@ -604,45 +615,30 @@ def auth_message(message):
             result = _worker.call(lambda: _worker.sign_code(data["phone"], code, data["phone_code_hash"]), 90)
             if result == "2fa":
                 data["state"] = "2fa"
-                with _auth_lock:
-                    _auth_states[uid] = data
+                with _auth_lock: _auth_states[uid] = data
                 panel_send(message, "🔐 Введите облачный пароль Telegram 2FA.")
             else:
-                with _auth_lock:
-                    _auth_states.pop(uid, None)
+                with _auth_lock: _auth_states.pop(uid, None)
                 panel_send(message, "✅ Telegram-аккаунт успешно подключен.")
             return True
         if state == "2fa":
             _worker.call(lambda: _worker.sign_password(text), 90)
-            with _auth_lock:
-                _auth_states.pop(uid, None)
+            with _auth_lock: _auth_states.pop(uid, None)
             panel_send(message, "✅ Telegram-аккаунт успешно подключен.")
             return True
     except Exception as exc:
         name = type(exc).__name__
         logger.exception("Telegram Text: auth error")
-        messages = {
-            "PhoneCodeInvalidError": "❌ Неверный код. Запустите /text_account заново.",
-            "PhoneCodeExpiredError": "❌ Код устарел. Запустите /text_account заново.",
-            "PhoneNumberInvalidError": "❌ Неверный номер Telegram.",
-            "PhoneNumberBannedError": "❌ Этот номер заблокирован Telegram.",
-            "PhoneNumberOccupiedError": "❌ Этот номер уже используется другим Telegram-аккаунтом.",
-            "PasswordHashInvalidError": "❌ Неверный пароль 2FA.",
-            "ApiIdInvalidError": "❌ Telegram отклонил API ID/API HASH.",
-            "ApiIdPublishedFloodError": "❌ Telegram ограничил этот API ID. Попробуйте позже.",
-        }
+        messages = {"PhoneCodeInvalidError":"❌ Неверный код. Запустите /text_account заново.","PhoneCodeExpiredError":"❌ Код устарел. Запустите /text_account заново.","PhoneNumberInvalidError":"❌ Неверный номер Telegram.","PhoneNumberBannedError":"❌ Этот номер заблокирован Telegram.","PasswordHashInvalidError":"❌ Неверный пароль 2FA.","ApiIdInvalidError":"❌ Telegram отклонил API ID/API HASH.","ApiIdPublishedFloodError":"❌ Telegram ограничил этот API ID. Попробуйте позже."}
         panel_send(message, messages.get(name, f"❌ Ошибка авторизации: {name}"))
-        with _auth_lock:
-            _auth_states.pop(uid, None)
+        with _auth_lock: _auth_states.pop(uid, None)
         return True
     return False
 
 
 def command_lots(message):
-    if not authorized(message):
-        return
-    with _state_lock:
-        bindings = dict(_lot_bindings)
+    if not authorized(message): return
+    with _state_lock: bindings = dict(_lot_bindings)
     if not bindings:
         panel_send(message, "📦 Привязанных лотов Telegram Text нет.")
         return
@@ -654,14 +650,12 @@ def command_lots(message):
 
 
 def command_bind(message):
-    if not authorized(message):
-        return
+    if not authorized(message): return
     parts = msg_text(message).split(maxsplit=2)
     if len(parts) < 2 or not parts[1].isdigit():
         panel_send(message, "Использование: /text_bind LOT_ID [название]")
         return
-    lid = str(int(parts[1]))
-    title = parts[2] if len(parts) > 2 else ""
+    lid = str(int(parts[1])); title = parts[2] if len(parts) > 2 else ""
     with _state_lock:
         _lot_bindings[lid] = {"title": title, "enabled": True, "updated_at": time.time()}
         persist_state()
@@ -669,8 +663,7 @@ def command_bind(message):
 
 
 def command_unbind(message):
-    if not authorized(message):
-        return
+    if not authorized(message): return
     parts = msg_text(message).split(maxsplit=1)
     if len(parts) != 2 or not parts[1].isdigit():
         panel_send(message, "Использование: /text_unbind LOT_ID")
@@ -686,20 +679,15 @@ def new_order_handler(c, e):
     try:
         order = get_full_order(c, e)
         oid = str(getattr(order, "id", None) or getattr(e.order, "id", None) or "")
-        if not oid:
-            return
+        if not oid: return
         with _state_lock:
-            if oid in _orders:
-                return
+            if oid in _orders: return
         resolved = resolve_text_lot(c, e, order)
-        if not resolved:
-            return
+        if not resolved: return
         lot_id, source = resolved
         chat_id = getattr(e.order, "chat_id", None) or getattr(order, "chat_id", None)
-        buyer = (getattr(order, "buyer_username", None) or getattr(e.order, "buyer_username", None)
-                 or getattr(order, "buyer", None) or "")
-        buyer_id = (getattr(order, "buyer_id", None) or getattr(e.order, "buyer_id", None)
-                    or getattr(order, "buyer_user_id", None))
+        buyer = getattr(order, "buyer_username", None) or getattr(e.order, "buyer_username", None) or getattr(order, "buyer", None) or ""
+        buyer_id = getattr(order, "buyer_id", None) or getattr(e.order, "buyer_id", None) or getattr(order, "buyer_user_id", None)
         if chat_id is None and buyer:
             try:
                 chat = c.account.get_chat_by_name(buyer, True)
@@ -709,10 +697,7 @@ def new_order_handler(c, e):
         if chat_id is None:
             logger.error("Telegram Text: у заказа %s отсутствует chat_id", oid)
             return
-        record = {"order_id": oid, "lot_id": lot_id, "lot_source": source,
-                  "chat_id": chat_id, "buyer": buyer, "buyer_id": buyer_id,
-                  "username": None, "text": None, "status": STATUS_USERNAME,
-                  "error": None, "created_at": time.time()}
+        record = {"order_id":oid,"lot_id":lot_id,"lot_source":source,"chat_id":chat_id,"buyer":buyer,"buyer_id":buyer_id,"username":None,"text":None,"status":STATUS_USERNAME,"error":None,"created_at":time.time()}
         with _state_lock:
             _orders[oid] = record
             persist_state()
@@ -724,80 +709,67 @@ def new_order_handler(c, e):
 def message_handler(c, e):
     try:
         msg = e.message
-        if getattr(msg, "type", None) != MessageTypes.NON_SYSTEM:
-            return
+        if getattr(msg, "type", None) != MessageTypes.NON_SYSTEM: return
         author_id = getattr(msg, "author_id", None)
-        if author_id is not None and getattr(c.account, "id", None) is not None and str(author_id) == str(c.account.id):
-            return
+        if author_id is not None and getattr(c.account, "id", None) is not None and str(author_id) == str(c.account.id): return
         text = msg_text(msg)
-        if not text:
-            return
+        if not text: return
         oid, order = find_order_by_message(msg)
-        if not order:
-            return
+        if not order: return
         stored_buyer_id = order.get("buyer_id")
-        if stored_buyer_id is not None and author_id is not None and str(stored_buyer_id) != str(author_id):
-            return
+        if stored_buyer_id is not None and author_id is not None and str(stored_buyer_id) != str(author_id): return
         chat_id = getattr(msg, "chat_id", None) or order.get("chat_id")
         status = order.get("status")
 
         if is_refund(text):
-            refund_order(oid)
-            return
+            refund_order(oid); return
         if status == STATUS_SENDING:
-            send_funpay(chat_id, "⏳ Сообщение уже отправляется. Пожалуйста, подождите.")
-            return
+            send_funpay(chat_id, "⏳ Сообщение уже отправляется. Пожалуйста, подождите."); return
         if status == STATUS_USERNAME:
             username = normalize_username(text)
             if not username:
-                send_funpay(chat_id, "❌ Некорректный Telegram username. Отправьте @username или !возврат.")
-                return
+                send_funpay(chat_id, "❌ Некорректный Telegram username. Отправьте @username или !возврат."); return
             update_order(oid, username=username, status=STATUS_CONFIRM, error=None)
-            send_funpay(chat_id, f"📋 Получатель: {username}\n\nЕсли всё верно — отправьте «+».\nЕсли хотите изменить — отправьте новый username.\n\n❌ Для возврата: !возврат")
-            return
+            send_funpay(chat_id, f"📋 Получатель: {username}\n\nЕсли всё верно — отправьте «+».\nЕсли хотите изменить — отправьте новый username.\n\n❌ Для возврата: !возврат"); return
         if status == STATUS_CONFIRM:
             if is_plus(text):
                 update_order(oid, status=STATUS_TEXT, error=None)
-                send_funpay(chat_id, "💬 Отлично. Теперь отправьте текст, который нужно отправить этому пользователю.\n\nСледующее сообщение будет отправлено как текст.\n❗ Для отмены: !возврат")
-                return
+                send_funpay(chat_id, "💬 Отлично. Теперь отправьте текст, который нужно отправить этому пользователю.\n\nСледующее сообщение будет отправлено как текст.\n❗ Для отмены: !возврат"); return
             username = normalize_username(text)
             if username:
                 update_order(oid, username=username, status=STATUS_CONFIRM, error=None)
-                send_funpay(chat_id, f"📋 Получатель изменён: {username}\n\nЕсли всё верно — отправьте «+».\nДля возврата: !возврат")
-                return
-            send_funpay(chat_id, "❓ Отправьте «+» для подтверждения, новый @username или !возврат.")
-            return
+                send_funpay(chat_id, f"📋 Получатель изменён: {username}\n\nЕсли всё верно — отправьте «+».\nДля возврата: !возврат"); return
+            send_funpay(chat_id, "❓ Отправьте «+» для подтверждения, новый @username или !возврат."); return
         if status == STATUS_TEXT:
             if len(text) > MAX_TEXT:
-                send_funpay(chat_id, "❌ Максимальная длина текста — 4096 символов. Сократите текст и отправьте его снова.")
-                return
+                send_funpay(chat_id, "❌ Максимальная длина текста — 4096 символов. Сократите текст и отправьте его снова."); return
             update_order(oid, text=text, status=STATUS_SENDING, error=None)
             if not ensure_worker():
                 update_order(oid, status=STATUS_ERROR, error="worker_unavailable")
-                send_funpay(chat_id, "❌ Telegram-модуль не удалось запустить. Напишите + для повторной попытки или !возврат.")
-                return
-            try:
-                _worker.submit(oid)
+                send_funpay(chat_id, "❌ Telegram-модуль не удалось запустить. Напишите + для повторной попытки или !возврат."); return
+            try: _worker.submit(oid)
             except Exception:
                 update_order(oid, status=STATUS_ERROR, error="submit_failed")
-                send_funpay(chat_id, "❌ Не удалось запустить отправку. Напишите + для повторной попытки или !возврат.")
-                return
-            send_funpay(chat_id, "⏳ Отправляю сообщение...")
-            return
+                send_funpay(chat_id, "❌ Не удалось запустить отправку. Напишите + для повторной попытки или !возврат."); return
+            send_funpay(chat_id, "⏳ Проверяю возможность отправки и отправляю сообщение..."); return
+        if status == STATUS_PAID_GUARD:
+            if is_plus(text):
+                if not ensure_worker():
+                    send_funpay(chat_id, "❌ Telegram-модуль не удалось запустить."); return
+                update_order(oid, status=STATUS_SENDING, error=None)
+                _worker.submit(oid)
+                send_funpay(chat_id, "⏳ Повторно проверяю оплату за сообщения..."); return
+            send_funpay(chat_id, "⚠️ Сначала отключите плату за сообщения в Telegram, затем отправьте «+»."); return
         if status == STATUS_ERROR:
             if is_plus(text) and order.get("username") and order.get("text"):
                 if not ensure_worker():
-                    send_funpay(chat_id, "❌ Telegram-модуль не удалось запустить.")
-                    return
-                update_order(oid, status=STATUS_SENDING, error=None)
-                _worker.submit(oid)
-                send_funpay(chat_id, "⏳ Повторная попытка отправки запущена.")
-                return
+                    send_funpay(chat_id, "❌ Telegram-модуль не удалось запустить."); return
+                update_order(oid, status=STATUS_SENDING, error=None); _worker.submit(oid)
+                send_funpay(chat_id, "⏳ Повторная попытка отправки запущена."); return
             username = normalize_username(text)
             if username:
                 update_order(oid, username=username, status=STATUS_CONFIRM, error=None)
-                send_funpay(chat_id, f"📋 Получатель изменён: {username}\n\nНапишите + для подтверждения.")
-                return
+                send_funpay(chat_id, f"📋 Получатель изменён: {username}\n\nНапишите + для подтверждения."); return
             send_funpay(chat_id, "❓ Напишите + для повторной отправки, новый @username или !возврат.")
     except Exception:
         logger.exception("Telegram Text: ошибка обработки сообщения")
@@ -812,15 +784,8 @@ def post_init(c):
         if not getattr(c, "telegram", None):
             logger.warning("Telegram Text: Telegram-панель Cardinal отключена")
             return
-        if not ensure_worker():
-            logger.warning("Telegram Text: worker пока не запущен")
-        c.add_telegram_commands(UUID, [
-            ("text_account", "Показать/настроить Telegram аккаунт", True),
-            ("text_account_reset", "Повторно авторизовать Telegram аккаунт", False),
-            ("text_lots", "Показать привязанные лоты", True),
-            ("text_bind", "Привязать лот", False),
-            ("text_unbind", "Отвязать лот", False),
-        ])
+        ensure_worker()
+        c.add_telegram_commands(UUID, [("text_account","Показать/настроить Telegram аккаунт",True),("text_account_reset","Повторно авторизовать Telegram аккаунт",False),("text_lots","Показать привязанные лоты",True),("text_bind","Привязать лот",False),("text_unbind","Отвязать лот",False)])
         tg = c.telegram
         tg.msg_handler(command_account, commands=["text_account"])
         tg.msg_handler(command_account_reset, commands=["text_account_reset"])
@@ -836,8 +801,7 @@ def post_init(c):
 def post_stop(c):
     global _worker
     if _worker is not None:
-        _worker.stop()
-        _worker = None
+        _worker.stop(); _worker = None
     logger.info("Telegram Text: worker остановлен")
 
 
