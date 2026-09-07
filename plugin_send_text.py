@@ -23,6 +23,9 @@ import threading
 import time
 import unicodedata
 from pathlib import Path
+from types import SimpleNamespace
+
+from FunPayAPI.types import MessageTypes
 
 NAME = "Telegram Text"
 VERSION = "5.0.0"
@@ -933,6 +936,30 @@ def new_message(c, event):
         log.exception("Telegram Text: message handler failed")
 
 
+def old_message(c, event):
+    """Process LastChatMessageChangedEvent when oldMsgGetMode=1."""
+    if not getattr(c, "old_mode_enabled", False):
+        return
+    chat = getattr(event, "chat", None)
+    if chat is None:
+        return
+    if getattr(chat, "last_message_type", None) is not MessageTypes.NON_SYSTEM:
+        return
+    if getattr(chat, "last_by_bot", False):
+        return
+    text = clean(getattr(chat, "last_message_text", None))
+    if not text:
+        return
+    message = SimpleNamespace(
+        chat_id=getattr(chat, "id", None),
+        author_id=None,
+        author=getattr(chat, "name", None),
+        by_bot=False,
+        text=text,
+    )
+    new_message(c, SimpleNamespace(message=message))
+
+
 def post_init(c):
     global _cardinal
     _cardinal = c
@@ -980,5 +1007,6 @@ def post_stop(c):
 BIND_TO_POST_INIT = [post_init]
 BIND_TO_NEW_ORDER = [new_order]
 BIND_TO_NEW_MESSAGE = [new_message]
+BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [old_message]
 BIND_TO_POST_STOP = [post_stop]
 BIND_TO_DELETE = None
