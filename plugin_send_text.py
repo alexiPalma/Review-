@@ -937,39 +937,51 @@ def new_message(c, event):
 
 
 def old_message(c, event):
-    """Process old Cardinal mode using the real full FunPay message, not the 250-char ChatShortcut text."""
+    """Convert Cardinal old-mode chat changes into the same full Message flow."""
     if not getattr(c, "old_mode_enabled", False):
         return
     chat = getattr(event, "chat", None)
     if chat is None:
         return
-    if getattr(chat, "last_message_type", None) != MessageTypes.NON_SYSTEM:
-        return
-    if getattr(chat, "last_by_bot", False):
-        return
-    try:
-        messages = c.account.get_chat_history(
-            chat.id,
-            last_message_id=None,
-            interlocutor_username=getattr(chat, "name", None),
-        )
-        if not messages:
-            return
-        message = messages[-1]
-        if getattr(message, "chat_id", None) is not None and str(message.chat_id) != str(chat.id):
-            return
-        if getattr(message, "by_bot", False):
-            return
-        if getattr(message, "author_id", None) is not None and getattr(c.account, "id", None) is not None:
-            if str(message.author_id) == str(c.account.id):
+
+    def recover_and_process():
+        try:
+            account_id = getattr(c.account, "id", None)
+            message = None
+            for attempt in range(5):
+                messages = c.account.get_chat_history(
+                    chat.id,
+                    last_message_id=None,
+                    interlocutor_username=getattr(chat, "name", None),
+                )
+                for candidate in reversed(messages or []):
+                    if getattr(candidate, "chat_id", None) is not None and str(candidate.chat_id) != str(chat.id):
+                        continue
+                    if getattr(candidate, "by_bot", False):
+                        continue
+                    author_id = getattr(candidate, "author_id", None)
+                    if author_id is not None and account_id is not None and str(author_id) == str(account_id):
+                        continue
+                    if message_text(candidate):
+                        message = candidate
+                        break
+                if message is not None:
+                    break
+                time.sleep(0.2)
+
+            if message is None:
+                log.warning("Telegram Text: old mode could not recover incoming Message for chat %s", chat.id)
                 return
-        if getattr(message, "type", None) != MessageTypes.NON_SYSTEM:
-            return
-        if not message_text(message):
-            return
-        new_message(c, SimpleNamespace(message=message))
-    except Exception:
-        log.exception("Telegram Text: old mode full message fetch failed")
+
+            new_message(c, SimpleNamespace(message=message))
+        except Exception:
+            log.exception("Telegram Text: old mode full message recovery failed")
+
+    threading.Thread(
+        target=recover_and_process,
+        name="telegram-text-old-mode",
+        daemon=True,
+    ).start()
 
 
 def post_init(c):
