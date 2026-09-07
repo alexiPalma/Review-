@@ -1,0 +1,46 @@
+name: Surgical old-mode patch
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.event.head_commit.message != 'Apply old-mode message handling to Telegram Text'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Patch and verify
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('plugin_send_text.py')
+          s = p.read_text(encoding='utf-8')
+          old_import = 'from pathlib import Path\n'
+          new_import = 'from pathlib import Path\nfrom types import SimpleNamespace\n\nfrom FunPayAPI.types import MessageTypes\n'
+          assert s.count(old_import) == 1
+          s = s.replace(old_import, new_import, 1)
+          marker = '\n\ndef post_init(c):\n'
+          adapter = '''\n\ndef old_message(c, event):\n    """Process LastChatMessageChangedEvent when oldMsgGetMode=1."""\n    if not getattr(c, "old_mode_enabled", False):\n        return\n    chat = getattr(event, "chat", None)\n    if chat is None:\n        return\n    if getattr(chat, "last_message_type", None) is not MessageTypes.NON_SYSTEM:\n        return\n    if getattr(chat, "last_by_bot", False):\n        return\n    text = clean(getattr(chat, "last_message_text", None))\n    if not text:\n        return\n    message = SimpleNamespace(\n        chat_id=getattr(chat, "id", None),\n        author_id=None,\n        author=getattr(chat, "name", None),\n        by_bot=False,\n        text=text,\n    )\n    new_message(c, SimpleNamespace(message=message))\n'''
+          assert s.count(marker) == 1
+          s = s.replace(marker, adapter + marker, 1)
+          old_bind = 'BIND_TO_NEW_MESSAGE = [new_message]\nBIND_TO_POST_STOP = [post_stop]'
+          new_bind = 'BIND_TO_NEW_MESSAGE = [new_message]\nBIND_TO_LAST_CHAT_MESSAGE_CHANGED = [old_message]\nBIND_TO_POST_STOP = [post_stop]'
+          assert s.count(old_bind) == 1
+          s = s.replace(old_bind, new_bind, 1)
+          p.write_text(s, encoding='utf-8')
+          compile(s, str(p), 'exec')
+          assert 'BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [old_message]' in s
+          assert s.count('def old_message(') == 1
+          assert s.count('def new_message(') == 1
+          print('PATCH VERIFIED')
+          PY
+      - name: Commit only target file and remove workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add plugin_send_text.py
+          git commit -m 'Apply old-mode message handling to Telegram Text'
+          git rm .github/workflows/patch_send_text_old_mode.yml
+          git commit -m 'Remove temporary patch workflow'
+          git push
