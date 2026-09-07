@@ -937,27 +937,39 @@ def new_message(c, event):
 
 
 def old_message(c, event):
-    """Process LastChatMessageChangedEvent when oldMsgGetMode=1."""
+    """Process old Cardinal mode using the real full FunPay message, not the 250-char ChatShortcut text."""
     if not getattr(c, "old_mode_enabled", False):
         return
     chat = getattr(event, "chat", None)
     if chat is None:
         return
-    if getattr(chat, "last_message_type", None) is not MessageTypes.NON_SYSTEM:
+    if getattr(chat, "last_message_type", None) != MessageTypes.NON_SYSTEM:
         return
     if getattr(chat, "last_by_bot", False):
         return
-    text = clean(getattr(chat, "last_message_text", None))
-    if not text:
-        return
-    message = SimpleNamespace(
-        chat_id=getattr(chat, "id", None),
-        author_id=None,
-        author=getattr(chat, "name", None),
-        by_bot=False,
-        text=text,
-    )
-    new_message(c, SimpleNamespace(message=message))
+    try:
+        messages = c.account.get_chat_history(
+            chat.id,
+            last_message_id=None,
+            interlocutor_username=getattr(chat, "name", None),
+        )
+        if not messages:
+            return
+        message = messages[-1]
+        if getattr(message, "chat_id", None) is not None and str(message.chat_id) != str(chat.id):
+            return
+        if getattr(message, "by_bot", False):
+            return
+        if getattr(message, "author_id", None) is not None and getattr(c.account, "id", None) is not None:
+            if str(message.author_id) == str(c.account.id):
+                return
+        if getattr(message, "type", None) != MessageTypes.NON_SYSTEM:
+            return
+        if not message_text(message):
+            return
+        new_message(c, SimpleNamespace(message=message))
+    except Exception:
+        log.exception("Telegram Text: old mode full message fetch failed")
 
 
 def post_init(c):
