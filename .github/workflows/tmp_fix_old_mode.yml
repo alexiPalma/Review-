@@ -1,0 +1,32 @@
+name: tmp-fix-old-mode
+on:
+  push:
+    branches: [main]
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('plugin_send_text.py')
+          s = p.read_text(encoding='utf-8')
+          old = '''def old_message(c, event):\n    """Process LastChatMessageChangedEvent when oldMsgGetMode=1."""\n    if not getattr(c, "old_mode_enabled", False):\n        return\n    chat = getattr(event, "chat", None)\n    if chat is None:\n        return\n    if getattr(chat, "last_message_type", None) is not MessageTypes.NON_SYSTEM:\n        return\n    if getattr(chat, "last_by_bot", False):\n        return\n    text = clean(getattr(chat, "last_message_text", None))\n    if not text:\n        return\n    message = SimpleNamespace(\n        chat_id=getattr(chat, "id", None),\n        author_id=None,\n        author=getattr(chat, "name", None),\n        by_bot=False,\n        text=text,\n    )\n    new_message(c, SimpleNamespace(message=message))\n'''
+          new = '''def old_message(c, event):\n    """Process old Cardinal mode using the real full FunPay message, not the 250-char ChatShortcut text."""\n    if not getattr(c, "old_mode_enabled", False):\n        return\n    chat = getattr(event, "chat", None)\n    if chat is None:\n        return\n    if getattr(chat, "last_message_type", None) != MessageTypes.NON_SYSTEM:\n        return\n    if getattr(chat, "last_by_bot", False):\n        return\n    try:\n        messages = c.account.get_chat_history(\n            chat.id,\n            last_message_id=None,\n            interlocutor_username=getattr(chat, "name", None),\n        )\n        if not messages:\n            return\n        message = messages[-1]\n        if getattr(message, "chat_id", None) is not None and str(message.chat_id) != str(chat.id):\n            return\n        if getattr(message, "by_bot", False):\n            return\n        if getattr(message, "author_id", None) is not None and getattr(c.account, "id", None) is not None:\n            if str(message.author_id) == str(c.account.id):\n                return\n        if getattr(message, "type", None) != MessageTypes.NON_SYSTEM:\n            return\n        if not message_text(message):\n            return\n        new_message(c, SimpleNamespace(message=message))\n    except Exception:\n        log.exception("Telegram Text: old mode full message fetch failed")\n'''
+          if old not in s:
+              raise SystemExit('expected old_message block not found')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+      - name: Commit and remove workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/tmp_fix_old_mode.yml
+          git add plugin_send_text.py .github/workflows/tmp_fix_old_mode.yml
+          git commit -m 'fix: handle full messages in Cardinal old mode'
+          git push
